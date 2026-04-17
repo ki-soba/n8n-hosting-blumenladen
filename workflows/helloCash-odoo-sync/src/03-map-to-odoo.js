@@ -9,6 +9,11 @@
  */
 
 const config = $('Config Loader').first().json;
+
+// Try to use auto‑detected locale (from Locale Detector node)
+const locale = $flow.get('locale');
+const useLocale = locale && !locale.fallback;
+
 const input = items[0].json;
 
 // Check if previous step was skipped or empty
@@ -73,14 +78,46 @@ function getTaxInfo(entry, invoice) {
   // Default to 19% tax
   let taxPercent = 19;
   let taxId = config.taxes['19'];
-  
+
+  // If locale detection provided tax mapping, use it
+  if (useLocale && locale.taxes.mapping) {
+    taxId = locale.taxes.mapping[taxPercent] || taxId;
+  }
+
   // Check if invoice has tax information
   if (invoice?.invoice_taxRate) {
     const invoiceTax = parseFloat(String(invoice.invoice_taxRate));
-    if (!isNaN(invoiceTax) && config.taxes[invoiceTax.toString()]) {
+    if (!isNaN(invoiceTax)) {
       taxPercent = invoiceTax;
-      taxId = config.taxes[invoiceTax.toString()];
+      if (useLocale && locale.taxes.mapping[invoiceTax]) {
+        taxId = locale.taxes.mapping[invoiceTax];
+      } else if (config.taxes[invoiceTax.toString()]) {
+        taxId = config.taxes[invoiceTax.toString()];
+      }
     }
+  }
+
+  // Check if entry has explicit tax
+  if (entry.cashBook_taxRate) {
+    const entryTax = parseFloat(String(entry.cashBook_taxRate));
+    if (!isNaN(entryTax)) {
+      taxPercent = entryTax;
+      if (useLocale && locale.taxes.mapping[entryTax]) {
+        taxId = locale.taxes.mapping[entryTax];
+      } else if (config.taxes[entryTax.toString()]) {
+        taxId = config.taxes[entryTax.toString()];
+      }
+    }
+  }
+
+  // Fallback: if we still have no taxId but locale suggests one, use it
+  if (!taxId && useLocale && locale.taxes.available.length > 0) {
+    taxId = locale.taxes.available[0].id;
+    $log.warn(`Using first available tax ID ${taxId} for ${taxPercent}%`);
+  }
+
+  return { taxPercent, taxId };
+}
   }
   
   // Check if entry has explicit tax
@@ -119,6 +156,10 @@ for (const entry of entries) {
     
     // Get account mapping
     const accountMap = config.accountMap[paymentType];
+    // Log locale account suggestions if available
+    if (useLocale && locale.accounts.suggestions) {
+      $log.debug(`Locale suggests accounts: Kasse ${locale.accounts.suggestions.kasse}, Bank ${locale.accounts.suggestions.bank}, Erlöse ${locale.accounts.suggestions.erloese}, Gutschein ${locale.accounts.suggestions.gutschein}`);
+    }
     if (!accountMap) {
       errors.push({ id: entryId, error: `No account mapping for payment type: ${paymentType}` });
       continue;

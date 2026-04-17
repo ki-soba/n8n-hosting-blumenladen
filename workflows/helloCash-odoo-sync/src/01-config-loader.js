@@ -146,7 +146,7 @@ const config = {
     '7': parseInteger('TAX_ID_7', $env.TAX_ID_7, 1),
     '19': parseInteger('TAX_ID_19', $env.TAX_ID_19, 1),
   },
-
+  // Payment type → account mapping (auto‑generated from accounts)  accountMap: {    CASH: {      debit: config.accounts.kasse,      credit: config.accounts.erloese,    },    EC: {      debit: config.accounts.bank,      credit: config.accounts.erloese,    },    CREDITCARD: {      debit: config.accounts.bank,      credit: config.accounts.erloese,    },    VOUCHER: {      debit: config.accounts.gutschein,      credit: config.accounts.erloese,    },  },
   // Sync configuration
   sync: {
     hour: parseInteger('SYNC_HOUR', $env.SYNC_HOUR, 0, 23),
