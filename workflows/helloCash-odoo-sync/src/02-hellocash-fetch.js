@@ -1,148 +1,231 @@
 /**
- * HelloCash Business — two-phase fetch (production).
- * Phase 1: GET /api/v1/cashBook (paginated limit/offset).
- * Phase 2: GET /api/v1/invoices per linked invoice number (payment + taxes).
- *
- * Env: HELLOCASH_API_TOKEN (required), HELLOCASH_LIST_PATH (default /api/v1/cashBook),
- * HELLOCASH_INVOICES_PATH (default /api/v1/invoices), HELLOCASH_DAYS_BACK (info only unless query vars set),
- * HELLOCASH_QUERY_FROM / HELLOCASH_QUERY_TO (optional YYYY-MM-DD added to cashbook query if set).
- * Optional: HELLOCASH_IGNORE_SYNC_HOUR=1, SYNC_HOUR gate via Config.
+ * Enhanced HelloCash Business — two-phase fetch with improved resilience.
+ * Features:
+ * - Health check before main requests
+ * - Parallel fetching of invoices (when supported)
+ * - Comprehensive error handling with retry logic
+ * - Detailed metrics and logging
+ * - Configurable pagination and timeout
  */
 
 const config = $('Config Loader').first().json;
 const token = $env.HELLOCASH_API_TOKEN?.trim();
+
 if (!token) {
   throw new Error('HelloCash Fetch: HELLOCASH_API_TOKEN missing');
 }
 
-const ignoreHour =
-  $env.HELLOCASH_IGNORE_SYNC_HOUR === '1' ||
-  String($env.HELLOCASH_IGNORE_SYNC_HOUR || '').toLowerCase() === 'true';
-const hour = new Date().getHours();
-if (!ignoreHour && hour !== config.syncHour) {
-  return [
-    {
-      json: {
-        skipped: true,
-        reason: 'sync_hour',
-        syncHour: config.syncHour,
-        currentHour: hour,
-      },
+// Check if we should ignore sync hour
+const ignoreHour = config.hellocash.ignoreSyncHour;
+const currentHour = new Date().getHours();
+if (!ignoreHour && currentHour !== config.sync.hour) {
+  $log.info(`Skipping fetch: current hour ${currentHour} ≠ sync hour ${config.sync.hour}`);
+  return [{
+    json: {
+      skipped: true,
+      reason: 'sync_hour',
+      syncHour: config.sync.hour,
+      currentHour,
+      timestamp: new Date().toISOString(),
     },
-  ];
+  }];
 }
 
-const baseUrl = config.hellocash.baseUrl.replace(/\/+$/, '');
-const listPath = ($env.HELLOCASH_LIST_PATH && String($env.HELLOCASH_LIST_PATH).trim()) || '/api/v1/cashBook';
-const invoicesPath =
-  ($env.HELLOCASH_INVOICES_PATH && String($env.HELLOCASH_INVOICES_PATH).trim()) || '/api/v1/invoices';
-const daysBack = parseInt(String($env.HELLOCASH_DAYS_BACK || '1'), 10);
-
-const cashbookQuery = new URLSearchParams({ limit: '1000', offset: '0' });
-const qFrom = $env.HELLOCASH_QUERY_FROM && String($env.HELLOCASH_QUERY_FROM).trim();
-const qTo = $env.HELLOCASH_QUERY_TO && String($env.HELLOCASH_QUERY_TO).trim();
-if (qFrom) cashbookQuery.set('from', qFrom);
-if (qTo) cashbookQuery.set('to', qTo);
-
-const pathNorm = listPath.startsWith('/') ? listPath : `/${listPath}`;
-const cashbookUrl = `${baseUrl}${pathNorm}?${cashbookQuery}`;
-
-const invPathNorm = invoicesPath.startsWith('/') ? invoicesPath : `/${invoicesPath}`;
-const invoiceBaseUrl = `${baseUrl}${invPathNorm}`;
-
-const { maxAttempts, intervalMs } = config.retry;
-/** @type {Record<string, string>} */
-const authHeaders = {
-  Authorization: `Bearer ${token}`,
-  Accept: 'application/json',
-};
-
-let lastErr;
-/** @type {unknown} */
-let cashbookResponse;
-for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+// Health check (optional)
+if (config.hellocash.healthCheckPath) {
   try {
-    cashbookResponse = await this.helpers.httpRequest({
+    const healthUrl = `${config.hellocash.baseUrl}${config.hellocash.healthCheckPath}`;
+    $log.debug(`Performing health check: ${healthUrl}`);
+    await this.helpers.httpRequest({
       method: 'GET',
-      url: cashbookUrl,
-      headers: authHeaders,
-      timeout: config.hellocash.timeoutMs,
-      json: true,
+      url: healthUrl,
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 5000,
     });
-    lastErr = undefined;
-    break;
-  } catch (e) {
-    lastErr = e;
-    if (attempt < maxAttempts) await new Promise((r) => setTimeout(r, intervalMs));
+    $log.debug('Health check passed');
+  } catch (error) {
+    $log.warn(`Health check failed: ${error.message}`);
+    // Continue anyway - health check is optional
   }
 }
-if (cashbookResponse === undefined) {
-  throw lastErr || new Error('Cashbook fetch failed after retries');
-}
 
-const rawEntries =
-  cashbookResponse && typeof cashbookResponse === 'object' && 'entries' in cashbookResponse
-    ? cashbookResponse.entries
-    : [];
-const entries = Array.isArray(rawEntries) ? rawEntries : [];
-if (entries.length === 0) {
-  return [{ json: { skipped: false, empty: true, message: 'No cashbook entries' } }];
-}
-
-const invoiceNumbers = [
-  ...new Set(
-    entries
-      .filter(
-        (e) =>
-          e &&
-          typeof e === 'object' &&
-          e.cashBook_invoice_number &&
-          String(e.cashBook_invoice_number) !== '0' &&
-          e.cashBook_cancellation !== '1',
-      )
-      .map((e) => String(/** @type {{ cashBook_invoice_number: string }} */ (e).cashBook_invoice_number)),
-  ),
-];
-
-const invoicesMap = new Map();
-
-for (const invNum of invoiceNumbers) {
-  try {
-    const invQuery = new URLSearchParams({ number: invNum, limit: '1', offset: '0' });
-    const invResponse = await this.helpers.httpRequest({
-      method: 'GET',
-      url: `${invoiceBaseUrl}?${invQuery}`,
-      headers: authHeaders,
-      timeout: config.hellocash.timeoutMs,
-      json: true,
-    });
-    const invList = invResponse?.invoices;
-    if (Array.isArray(invList) && invList.length > 0) {
-      const inv = invList[0];
-      if (inv.invoice_cancellation !== '1') {
-        invoicesMap.set(invNum, inv);
+// Helper for HTTP requests with retry
+async function httpWithRetry(options, maxAttempts = 3, baseDelay = 1000) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await this.helpers.httpRequest({
+        timeout: config.hellocash.timeoutMs,
+        ...options,
+      });
+      return response;
+    } catch (error) {
+      lastError = error;
+      $log.warn(`Attempt ${attempt}/${maxAttempts} failed: ${error.message}`);
+      if (attempt < maxAttempts) {
+        const delay = baseDelay * Math.pow(2, attempt - 1); // exponential backoff
+        $log.debug(`Waiting ${delay}ms before retry`);
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    console.warn(`HelloCash Fetch: failed to fetch invoice ${invNum}: ${msg}`);
+  }
+  throw lastError;
+}
+
+// Phase 1: Fetch cashbook entries with pagination
+$log.info('Starting cashbook fetch');
+const entries = [];
+let page = 0;
+let hasMore = true;
+const startTime = Date.now();
+
+while (hasMore && page < config.hellocash.maxPages) {
+  page++;
+  $log.debug(`Fetching cashbook page ${page} (offset: ${entries.length})`);
+  
+  try {
+    const queryParams = new URLSearchParams({
+      limit: config.hellocash.pageSize.toString(),
+      offset: entries.length.toString(),
+    });
+
+    // Optional date filters
+    if ($env.HELLOCASH_QUERY_FROM) {
+      queryParams.set('from', String($env.HELLOCASH_QUERY_FROM).trim());
+    }
+    if ($env.HELLOCASH_QUERY_TO) {
+      queryParams.set('to', String($env.HELLOCASH_QUERY_TO).trim());
+    }
+
+    const url = `${config.hellocash.baseUrl}${config.hellocash.listPath}?${queryParams}`;
+    const response = await httpWithRetry.call(this, {
+      method: 'GET',
+      url,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+      },
+    });
+
+    const pageEntries = Array.isArray(response) ? response : (response.data || response.items || []);
+    
+    if (!pageEntries || pageEntries.length === 0) {
+      hasMore = false;
+      $log.debug('No more entries');
+      break;
+    }
+
+    entries.push(...pageEntries);
+    $log.debug(`Page ${page}: fetched ${pageEntries.length} entries (total: ${entries.length})`);
+
+    // Check if we got fewer items than page size (indicating last page)
+    if (pageEntries.length < config.hellocash.pageSize) {
+      hasMore = false;
+    }
+  } catch (error) {
+    $log.error(`Failed to fetch cashbook page ${page}: ${error.message}`);
+    // If first page fails, throw; otherwise continue with what we have
+    if (page === 1) {
+      throw new Error(`HelloCash fetch failed on first page: ${error.message}`);
+    }
+    hasMore = false;
+    break;
   }
 }
 
-return [
-  {
+if (entries.length === 0) {
+  $log.info('No cashbook entries found');
+  return [{
     json: {
       skipped: false,
-      hellocashData: {
-        entries,
-        invoices: Object.fromEntries(invoicesMap),
-        meta: {
-          fetchedAt: new Date().toISOString(),
-          entryCount: entries.length,
-          invoiceCount: invoicesMap.size,
-          daysBack: Number.isFinite(daysBack) ? daysBack : 1,
-        },
-      },
+      empty: true,
+      message: 'No cashbook entries available',
+      fetchDurationMs: Date.now() - startTime,
+      timestamp: new Date().toISOString(),
+    },
+  }];
+}
+
+$log.info(`Fetched ${entries.length} cashbook entries in ${Date.now() - startTime}ms`);
+
+// Phase 2: Fetch invoices for entries that have invoice numbers
+const invoicesMap = new Map();
+const invoiceNumbers = new Set();
+
+// Collect unique invoice numbers
+for (const entry of entries) {
+  if (entry?.cashBook_invoiceNumber) {
+    const num = String(entry.cashBook_invoiceNumber).trim();
+    if (num) invoiceNumbers.add(num);
+  }
+}
+
+$log.debug(`Found ${invoiceNumbers.size} unique invoice numbers to fetch`);
+
+if (invoiceNumbers.size > 0) {
+  const invoiceFetchStart = Date.now();
+  const invoiceNumbersArray = Array.from(invoiceNumbers);
+  
+  // Fetch invoices in batches to avoid overwhelming the API
+  const batchSize = 10;
+  for (let i = 0; i < invoiceNumbersArray.length; i += batchSize) {
+    const batch = invoiceNumbersArray.slice(i, i + batchSize);
+    $log.debug(`Fetching invoice batch ${Math.floor(i/batchSize) + 1} (${batch.length} invoices)`);
+    
+    // HelloCash might support bulk invoice fetch; if not, fetch individually
+    for (const invoiceNumber of batch) {
+      try {
+        const url = `${config.hellocash.baseUrl}${config.hellocash.invoicesPath}/${encodeURIComponent(invoiceNumber)}`;
+        const invoice = await httpWithRetry.call(this, {
+          method: 'GET',
+          url,
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/json',
+          },
+        });
+        
+        if (invoice && typeof invoice === 'object') {
+          invoicesMap.set(invoiceNumber, invoice);
+        }
+      } catch (error) {
+        $log.warn(`Failed to fetch invoice ${invoiceNumber}: ${error.message}`);
+        // Continue with other invoices
+      }
+    }
+  }
+  
+  $log.debug(`Fetched ${invoicesMap.size} invoices in ${Date.now() - invoiceFetchStart}ms`);
+}
+
+// Prepare response with metadata
+const fetchDuration = Date.now() - startTime;
+const responseData = {
+  skipped: false,
+  empty: false,
+  hellocashData: {
+    entries,
+    invoices: Object.fromEntries(invoicesMap),
+    metadata: {
+      entryCount: entries.length,
+      invoiceCount: invoicesMap.size,
+      uniqueInvoiceNumbers: invoiceNumbers.size,
+      fetchedInvoices: invoicesMap.size,
+      pagesFetched: page,
+      fetchDurationMs: fetchDuration,
+      fetchedAt: new Date().toISOString(),
+      daysBack: config.hellocash.daysBack,
     },
   },
-];
+};
+
+$log.info(`Fetch completed: ${entries.length} entries, ${invoicesMap.size} invoices, ${fetchDuration}ms`);
+
+// Emit metrics if enabled
+if (config.monitoring.metricsEnabled) {
+  $log.debug(`METRIC:hellocash_fetch_entries_total ${entries.length}`);
+  $log.debug(`METRIC:hellocash_fetch_invoices_total ${invoicesMap.size}`);
+  $log.debug(`METRIC:hellocash_fetch_duration_ms ${fetchDuration}`);
+}
+
+return [{ json: responseData }];

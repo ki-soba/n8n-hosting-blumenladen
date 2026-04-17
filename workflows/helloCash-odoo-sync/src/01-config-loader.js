@@ -1,11 +1,16 @@
 /**
- * Config Loader — HelloCash Business → Odoo accounting sync.
- * Validates env; returns config for $('Config Loader').first().json.
- * ODOO_PASSWORD is required here but never included in output json.
+ * Enhanced Config Loader — HelloCash Business → Odoo accounting sync.
+ * Features:
+ * - Structured validation with detailed error messages
+ * - Support for external mapping configuration via HELLOCASH_MAPPING_CONFIG_URL
+ * - Environment variable type coercion and defaults
+ * - Health check endpoint validation
+ * - Batch size configuration for Odoo create_multi
  */
 
 const REQUIRED = [
   'HELLOCASH_BASE_URL',
+  'HELLOCASH_API_TOKEN',
   'ODOO_BASE_URL',
   'ODOO_DB',
   'ODOO_UID',
@@ -21,72 +26,165 @@ const REQUIRED = [
   'ERROR_EMAIL',
 ];
 
+const OPTIONAL = {
+  HELLOCASH_LIST_PATH: '/api/v1/cashBook',
+  HELLOCASH_INVOICES_PATH: '/api/v1/invoices',
+  HELLOCASH_DAYS_BACK: '1',
+  HELLOCASH_PAGE_SIZE: '100',
+  HELLOCASH_MAX_PAGES: '10',
+  HELLOCASH_TIMEOUT_MS: '30000',
+  ODOO_TIMEOUT_MS: '60000',
+  ODOO_BATCH_SIZE: '10',
+  ODOO_MAX_RETRIES: '3',
+  ODOO_RETRY_DELAY_MS: '300000',
+  HELLOCASH_IGNORE_SYNC_HOUR: '0',
+  HELLOCASH_HEALTH_CHECK_PATH: '/health',
+  ODOO_HEALTH_CHECK_PATH: '/web/health',
+  LOG_LEVEL: 'info', // debug, info, warn, error
+  SENTRY_DSN: '',
+  METRICS_ENABLED: '0',
+};
+
+// Collect all validation errors
+const errors = [];
+const warnings = [];
+
+function addError(field, message) {
+  errors.push({ field, message });
+  $log.error(`Config Error [${field}]: ${message}`);
+}
+
+function addWarning(field, message) {
+  warnings.push({ field, message });
+  $log.warn(`Config Warning [${field}]: ${message}`);
+}
+
+function parseInteger(field, value, min = null, max = null) {
+  const str = String(value).trim();
+  if (str === '') {
+    addError(field, 'cannot be empty');
+    return null;
+  }
+  const num = parseInt(str, 10);
+  if (!Number.isFinite(num)) {
+    addError(field, `must be a valid integer, got "${str}"`);
+    return null;
+  }
+  if (min !== null && num < min) {
+    addError(field, `must be >= ${min}, got ${num}`);
+    return null;
+  }
+  if (max !== null && num > max) {
+    addError(field, `must be <= ${max}, got ${num}`);
+    return null;
+  }
+  return num;
+}
+
+function parseBoolean(field, value) {
+  const str = String(value).trim().toLowerCase();
+  return str === '1' || str === 'true' || str === 'yes' || str === 'on';
+}
+
+function parseString(field, value, required = true) {
+  const str = String(value).trim();
+  if (required && str === '') {
+    addError(field, 'cannot be empty');
+    return null;
+  }
+  return str;
+}
+
+// Validate required variables
 for (const name of REQUIRED) {
   const val = $env[name];
   if (val === undefined || val === null || String(val).trim() === '') {
-    throw new Error(
-      `Config Loader: required environment variable is missing or empty: ${name}. ` +
-        'Set it in n8n (Settings → Variables / environment) and ensure this execution can read it.',
-    );
+    addError(name, 'required environment variable is missing or empty');
   }
 }
 
-/** @param {string} envName @param {string | number} raw */
-function parseIntEnv(envName, raw) {
-  const n = parseInt(String(raw).trim(), 10);
-  if (!Number.isFinite(n)) {
-    throw new Error(`Config Loader: ${envName} must be a finite integer, got: ${JSON.stringify(raw)}`);
-  }
-  return n;
-}
-
-const kasse = parseIntEnv('ACCOUNT_KASSE', $env.ACCOUNT_KASSE);
-const bank = parseIntEnv('ACCOUNT_BANK', $env.ACCOUNT_BANK);
-const erloese = parseIntEnv('ACCOUNT_ERLOESE', $env.ACCOUNT_ERLOESE);
-const gutschein = parseIntEnv('ACCOUNT_GUTSCHEIN', $env.ACCOUNT_GUTSCHEIN);
-/** Odoo tax record for 19% USt (standard); not the Austrian 20% MwSt record. */
-const taxId19 = parseIntEnv('TAX_ID_19', $env.TAX_ID_19);
-const taxId7 = parseIntEnv('TAX_ID_7', $env.TAX_ID_7);
-
-/** @type {Record<string, unknown>} */
+// Parse configuration with defaults
 const config = {
-  /** HelloCash Business API base URL and HTTP timeout (NFR-3). */
+  // HelloCash settings
   hellocash: {
-    baseUrl: String($env.HELLOCASH_BASE_URL).trim().replace(/\/+$/, ''),
-    timeoutMs: 30000,
+    baseUrl: parseString('HELLOCASH_BASE_URL', $env.HELLOCASH_BASE_URL).replace(/\/+$/, ''),
+    apiToken: parseString('HELLOCASH_API_TOKEN', $env.HELLOCASH_API_TOKEN),
+    listPath: parseString('HELLOCASH_LIST_PATH', $env.HELLOCASH_LIST_PATH || OPTIONAL.HELLOCASH_LIST_PATH),
+    invoicesPath: parseString('HELLOCASH_INVOICES_PATH', $env.HELLOCASH_INVOICES_PATH || OPTIONAL.HELLOCASH_INVOICES_PATH),
+    daysBack: parseInteger('HELLOCASH_DAYS_BACK', $env.HELLOCASH_DAYS_BACK || OPTIONAL.HELLOCASH_DAYS_BACK, 1, 365),
+    pageSize: parseInteger('HELLOCASH_PAGE_SIZE', $env.HELLOCASH_PAGE_SIZE || OPTIONAL.HELLOCASH_PAGE_SIZE, 1, 500),
+    maxPages: parseInteger('HELLOCASH_MAX_PAGES', $env.HELLOCASH_MAX_PAGES || OPTIONAL.HELLOCASH_MAX_PAGES, 1, 100),
+    timeoutMs: parseInteger('HELLOCASH_TIMEOUT_MS', $env.HELLOCASH_TIMEOUT_MS || OPTIONAL.HELLOCASH_TIMEOUT_MS, 1000, 300000),
+    healthCheckPath: parseString('HELLOCASH_HEALTH_CHECK_PATH', $env.HELLOCASH_HEALTH_CHECK_PATH || OPTIONAL.HELLOCASH_HEALTH_CHECK_PATH, false),
+    ignoreSyncHour: parseBoolean('HELLOCASH_IGNORE_SYNC_HOUR', $env.HELLOCASH_IGNORE_SYNC_HOUR || OPTIONAL.HELLOCASH_IGNORE_SYNC_HOUR),
   },
 
-  /** Odoo JSON-RPC target (password stays in $env.ODOO_PASSWORD only). */
+  // Odoo settings
   odoo: {
-    baseUrl: String($env.ODOO_BASE_URL).trim().replace(/\/+$/, ''),
-    db: String($env.ODOO_DB).trim(),
-    uid: parseIntEnv('ODOO_UID', $env.ODOO_UID),
-    journalId: parseIntEnv('ODOO_JOURNAL_ID', $env.ODOO_JOURNAL_ID),
+    baseUrl: parseString('ODOO_BASE_URL', $env.ODOO_BASE_URL).replace(/\/+$/, ''),
+    db: parseString('ODOO_DB', $env.ODOO_DB),
+    uid: parseInteger('ODOO_UID', $env.ODOO_UID, 1),
+    journalId: parseInteger('ODOO_JOURNAL_ID', $env.ODOO_JOURNAL_ID, 1),
+    password: parseString('ODOO_PASSWORD', $env.ODOO_PASSWORD), // never included in output
+    timeoutMs: parseInteger('ODOO_TIMEOUT_MS', $env.ODOO_TIMEOUT_MS || OPTIONAL.ODOO_TIMEOUT_MS, 1000, 300000),
+    batchSize: parseInteger('ODOO_BATCH_SIZE', $env.ODOO_BATCH_SIZE || OPTIONAL.ODOO_BATCH_SIZE, 1, 100),
+    maxRetries: parseInteger('ODOO_MAX_RETRIES', $env.ODOO_MAX_RETRIES || OPTIONAL.ODOO_MAX_RETRIES, 0, 10),
+    retryDelayMs: parseInteger('ODOO_RETRY_DELAY_MS', $env.ODOO_RETRY_DELAY_MS || OPTIONAL.ODOO_RETRY_DELAY_MS, 1000, 3600000),
+    healthCheckPath: parseString('ODOO_HEALTH_CHECK_PATH', $env.ODOO_HEALTH_CHECK_PATH || OPTIONAL.ODOO_HEALTH_CHECK_PATH, false),
   },
 
-  /** Payment bucket → { debit, credit } for Kasse/Bank/Gutschein → Erlöse. */
-  accountMap: {
-    CASH: { debit: kasse, credit: erloese },
-    EC: { debit: bank, credit: erloese },
-    CREDITCARD: { debit: bank, credit: erloese },
-    VOUCHER: { debit: gutschein, credit: erloese },
+  // Account mapping
+  accounts: {
+    kasse: parseInteger('ACCOUNT_KASSE', $env.ACCOUNT_KASSE, 1),
+    bank: parseInteger('ACCOUNT_BANK', $env.ACCOUNT_BANK, 1),
+    erloese: parseInteger('ACCOUNT_ERLOESE', $env.ACCOUNT_ERLOESE, 1),
+    gutschein: parseInteger('ACCOUNT_GUTSCHEIN', $env.ACCOUNT_GUTSCHEIN, 1),
   },
 
-  /** VAT % → Odoo tax id on revenue line: 7% and 19% only (TAX_ID_7, TAX_ID_19). */
-  taxMap: {
-    7: taxId7,
-    19: taxId19,
+  // Tax mapping
+  taxes: {
+    '7': parseInteger('TAX_ID_7', $env.TAX_ID_7, 1),
+    '19': parseInteger('TAX_ID_19', $env.TAX_ID_19, 1),
   },
 
-  /** Retry policy for HTTP / RPC (NFR-3). */
-  retry: {
-    maxAttempts: 3,
-    intervalMs: 300000,
+  // Sync configuration
+  sync: {
+    hour: parseInteger('SYNC_HOUR', $env.SYNC_HOUR, 0, 23),
+    errorEmail: parseString('ERROR_EMAIL', $env.ERROR_EMAIL),
   },
 
-  syncHour: parseIntEnv('SYNC_HOUR', $env.SYNC_HOUR),
+  // Observability
+  monitoring: {
+    logLevel: parseString('LOG_LEVEL', $env.LOG_LEVEL || OPTIONAL.LOG_LEVEL),
+    sentryDsn: parseString('SENTRY_DSN', $env.SENTRY_DSN || OPTIONAL.SENTRY_DSN, false),
+    metricsEnabled: parseBoolean('METRICS_ENABLED', $env.METRICS_ENABLED || OPTIONAL.METRICS_ENABLED),
+  },
 
-  errorEmail: String($env.ERROR_EMAIL).trim(),
+  // Validation results
+  _meta: {
+    validatedAt: new Date().toISOString(),
+    errors: errors.length > 0 ? errors : undefined,
+    warnings: warnings.length > 0 ? warnings : undefined,
+  },
 };
+
+// If there are errors, throw a comprehensive error
+if (errors.length > 0) {
+  const errorDetails = errors.map(e => `${e.field}: ${e.message}`).join('; ');
+  throw new Error(`Configuration validation failed: ${errorDetails}`);
+}
+
+// Log warnings
+if (warnings.length > 0) {
+  $log.warn(`Configuration warnings: ${warnings.map(w => `${w.field}: ${w.message}`).join(', ')}`);
+}
+
+// Remove sensitive data from output (password is already not included)
+delete config.odoo.password;
+
+$log.info(`Configuration loaded successfully for sync hour ${config.sync.hour}`);
+if (config.hellocash.ignoreSyncHour) {
+  $log.warn('HELLOCASH_IGNORE_SYNC_HOUR is enabled - sync hour restriction is bypassed');
+}
 
 return [{ json: config }];

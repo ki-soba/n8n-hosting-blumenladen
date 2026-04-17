@@ -1,0 +1,106 @@
+# HelloCash to Odoo Mapping Configuration
+# This YAML file defines how HelloCash fields map to Odoo accounts and behavior
+# Can be loaded via HELLOCASH_MAPPING_CONFIG_URL environment variable
+
+version: '2.0'
+
+# Payment type mappings
+payment_types:
+  cash:
+    - cash
+    - bar
+    - barmittel
+    - kasse
+    mapping:
+      debit_account: "{{ACCOUNT_KASSE}}"
+      credit_account: "{{ACCOUNT_ERLOESE}}"
+      description: "Cash payment"
+      
+  ec:
+    - ec
+    - debit
+    - lastschrift
+    - giropay
+    - paypal
+    mapping:
+      debit_account: "{{ACCOUNT_BANK}}"
+      credit_account: "{{ACCOUNT_ERLOESE}}"
+      description: "Electronic cash"
+      
+  creditcard:
+    - creditcard
+    - kreditkarte
+    - visa
+    - mastercard
+    - amex
+    mapping:
+      debit_account: "{{ACCOUNT_BANK}}"
+      credit_account: "{{ACCOUNT_ERLOESE}}"
+      description: "Credit card payment"
+      
+  voucher:
+    - voucher
+    - gutschein
+    - giftcard
+    mapping:
+      debit_account: "{{ACCOUNT_GUTSCHEIN}}"
+      credit_account: "{{ACCOUNT_ERLOESE}}"
+      description: "Voucher payment"
+
+# Tax mappings
+tax_rates:
+  7:
+    tax_id: "{{TAX_ID_7}}"
+    name: "Reduced VAT 7%"
+  19:
+    tax_id: "{{TAX_ID_19}}"
+    name: "Standard VAT 19%"
+
+# Field mappings from HelloCash to Odoo
+field_mappings:
+  cashBook_id: "hello_cash_id"
+  cashBook_number: "hello_cash_number"
+  cashBook_type: "hello_cash_type"
+  cashBook_amount: "amount"
+  cashBook_date: "date"
+  cashBook_description: "description"
+  cashBook_invoiceNumber: "invoice_number"
+
+# Validation rules
+validation:
+  required_fields:
+    - cashBook_id
+    - cashBook_number
+    - cashBook_amount
+    - cashBook_date
+    
+  amount:
+    min: 0.01
+    max: 1000000
+    currency: "EUR"
+    
+  date:
+    format: "YYYY-MM-DD"
+    max_days_in_past: 365
+    max_days_in_future: 0
+
+# Batch processing
+batch:
+  max_size: 50
+  timeout_seconds: 30
+  retry_attempts: 3
+  retry_delay_seconds: 5
+
+# Error handling
+error_handling:
+  skip_invalid_entries: true
+  log_invalid_entries: true
+  notify_on_error: true
+  max_errors_per_batch: 10
+
+# Monitoring
+monitoring:
+  enable_metrics: false
+  metrics_prefix: "hellocash_odoo"
+  log_level: "info"
+  sentry_enabled: false

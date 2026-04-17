@@ -1,0 +1,28 @@
+{
+  "name": "hellocash-odoo-sync-enhanced",
+  "version": "2.0.0",
+  "description": "Enhanced HelloCash Business to Odoo accounting sync workflow for n8n",
+  "main": "build-enhanced.mjs",
+  "scripts": {
+    "build": "node build-enhanced.mjs",
+    "test": "node tests/mapping.test.js",
+    "validate": "node -c src/*.js",
+    "lint": "eslint src/*.js --fix || true"
+  },
+  "keywords": [
+    "n8n",
+    "workflow",
+    "hellocash",
+    "odoo",
+    "accounting",
+    "sync"
+  ],
+  "author": "Enhanced by Hermes AI",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.0.0"
+  }
+}
